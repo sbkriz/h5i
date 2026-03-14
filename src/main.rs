@@ -5,7 +5,8 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use h5i_core::blame::BlameMode;
-use h5i_core::metadata::{AiMetadata, IntegrityLevel};
+use h5i_core::claude::{keyword_search, AnthropicClient};
+use h5i_core::metadata::{AiMetadata, IntegrityLevel, Severity};
 use h5i_core::repository::H5iRepository;
 use h5i_core::session::LocalSession;
 use h5i_core::ui::{ERROR, LOOKING, STEP, SUCCESS, WARN};
@@ -89,6 +90,41 @@ enum Commands {
         /// Relative path to the file to resolve
         file: String,
     },
+
+    /// Show the AST-level structural diff for a file
+    Diff {
+        /// Path to the file to analyse (must be a supported language, e.g. .py)
+        file: PathBuf,
+
+        /// Compare from this commit OID (default: HEAD)
+        #[arg(long)]
+        from: Option<String>,
+
+        /// Compare to this commit OID (default: working-tree file)
+        #[arg(long)]
+        to: Option<String>,
+    },
+
+    /// Revert the AI-generated commit whose intent best matches a description
+    Rollback {
+        /// Natural-language description of the change to undo (e.g. "OAuth login")
+        intent: String,
+
+        /// Number of recent commits to search
+        #[arg(short, long, default_value_t = 50)]
+        limit: usize,
+
+        /// Show the matched commit without actually reverting
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Skip the confirmation prompt
+        #[arg(short, long)]
+        yes: bool,
+    },
+
+    /// Print the Claude Code hook configuration to enable automatic prompt capture
+    InstallHooks,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -141,42 +177,66 @@ fn main() -> anyhow::Result<()> {
             let repo = H5iRepository::open(".")?;
             let sig = repo.git().signature()?; // Fetch system-default Git signature
 
+            // Resolution order: CLI flag > environment variable > pending_context.json
+            let pending = repo.read_pending_context()?;
+            let prompt = prompt
+                .or_else(|| std::env::var("H5I_PROMPT").ok())
+                .or_else(|| pending.as_ref().and_then(|c| c.prompt.clone()));
+            let model = model
+                .or_else(|| std::env::var("H5I_MODEL").ok())
+                .or_else(|| pending.as_ref().and_then(|c| c.model.clone()));
+            let agent = agent
+                .or_else(|| std::env::var("H5I_AGENT_ID").ok())
+                .or_else(|| pending.as_ref().and_then(|c| c.agent_id.clone()));
+
             if audit {
                 let report = repo.verify_integrity(prompt.as_deref(), &message)?;
+
+                // Print a header line based on the overall level.
                 match report.level {
-                    IntegrityLevel::Violation => {
-                        println!(
-                            "{} {} {}",
-                            ERROR,
-                            style("INTEGRITY VIOLATION").red().bold(),
-                            style(format!("(Score: {:.2})", report.score)).dim()
-                        );
-                        for f in report.findings {
-                            println!("  {} {}", style("-").red(), f);
-                        }
-                        if !force {
-                            println!(
-                                "\n{} Commit aborted. Use {} to override.",
-                                style("!").red(),
-                                style("--force").bold()
-                            );
-                            return Ok(());
-                        }
-                    }
-                    IntegrityLevel::Warning => {
-                        println!(
-                            "{} {} {}",
-                            WARN,
-                            style("INTEGRITY WARNING").yellow().bold(),
-                            style(format!("(Score: {:.2})", report.score)).dim()
-                        );
-                        for f in report.findings {
-                            println!("  {} {}", style("-").yellow(), f);
-                        }
-                    }
+                    IntegrityLevel::Violation => println!(
+                        "{} {} {}",
+                        ERROR,
+                        style("INTEGRITY VIOLATION").red().bold(),
+                        style(format!("(score: {:.2})", report.score)).dim()
+                    ),
+                    IntegrityLevel::Warning => println!(
+                        "{} {} {}",
+                        WARN,
+                        style("INTEGRITY WARNING").yellow().bold(),
+                        style(format!("(score: {:.2})", report.score)).dim()
+                    ),
                     IntegrityLevel::Valid => {
                         println!("{} {}", SUCCESS, style("Integrity check passed.").green());
                     }
+                }
+
+                // Print each finding with its rule ID and severity colour.
+                for f in &report.findings {
+                    let (bullet, label) = match f.severity {
+                        Severity::Violation => (
+                            style("✖").red().bold(),
+                            style(format!("[{}]", f.rule_id)).red().bold(),
+                        ),
+                        Severity::Warning => (
+                            style("⚠").yellow().bold(),
+                            style(format!("[{}]", f.rule_id)).yellow().bold(),
+                        ),
+                        Severity::Info => (
+                            style("ℹ").cyan(),
+                            style(format!("[{}]", f.rule_id)).cyan(),
+                        ),
+                    };
+                    println!("  {} {} {}", bullet, label, f.detail);
+                }
+
+                if matches!(report.level, IntegrityLevel::Violation) && !force {
+                    println!(
+                        "\n{} Commit aborted. Use {} to override.",
+                        style("!").red(),
+                        style("--force").bold()
+                    );
+                    return Ok(());
                 }
             }
 
@@ -191,17 +251,16 @@ fn main() -> anyhow::Result<()> {
                 None
             };
 
-            // Simple demo AST parser hook
-            let ast_parser = if ast {
-                Some(
-                    &(|_p: &std::path::Path| Some("(ast-node-root)".to_string()))
-                        as &dyn Fn(&std::path::Path) -> Option<String>,
-                )
+            // Build a real language-aware AST parser closure.
+            let parser_box = repo.make_ast_parser();
+            let ast_parser: Option<&dyn Fn(&std::path::Path) -> Option<String>> = if ast {
+                Some(parser_box.as_ref())
             } else {
                 None
             };
 
             let oid = repo.commit(&message, &sig, &sig, ai_meta, tests, ast_parser)?;
+            repo.clear_pending_context()?;
             println!(
                 "{} {} {}",
                 SUCCESS,
@@ -251,6 +310,225 @@ fn main() -> anyhow::Result<()> {
                     r.line_content
                 );
             }
+        }
+
+        Commands::Diff { file, from, to } => {
+            let repo = H5iRepository::open(".")?;
+
+            let from_oid = from.map(|s| Oid::from_str(&s)).transpose()?;
+            let to_oid = to.map(|s| Oid::from_str(&s)).transpose()?;
+
+            let label = match (&from_oid, &to_oid) {
+                (None, None) => "HEAD → working tree".to_string(),
+                (Some(f), None) => format!("{}… → working tree", &f.to_string()[..8]),
+                (None, Some(t)) => format!("HEAD → {}…", &t.to_string()[..8]),
+                (Some(f), Some(t)) => format!("{}… → {}…", &f.to_string()[..8], &t.to_string()[..8]),
+            };
+
+            println!(
+                "{} {} {} {}",
+                LOOKING,
+                style("Computing structural diff for").cyan().bold(),
+                style(file.display()).yellow(),
+                style(format!("({label})")).dim(),
+            );
+
+            let ast_diff = repo.diff_ast(&file, from_oid, to_oid)?;
+            ast_diff.print_stylish(&file.to_string_lossy());
+        }
+
+        Commands::Rollback {
+            intent,
+            limit,
+            dry_run,
+            yes,
+        } => {
+            let repo = H5iRepository::open(".")?;
+
+            println!(
+                "{} {} \"{}\" {} {} commits",
+                LOOKING,
+                style("Searching for intent:").cyan().bold(),
+                style(&intent).yellow(),
+                style("across last").dim(),
+                style(limit).dim(),
+            );
+
+            let commits = repo.list_ai_commits(limit)?;
+            if commits.is_empty() {
+                println!("{} No commits found in this repository.", WARN);
+                return Ok(());
+            }
+
+            // Semantic search via Claude, or fall back to keyword matching.
+            let matched_oid: Option<String> = if let Some(claude) = AnthropicClient::from_env() {
+                println!(
+                    "{} {} {}",
+                    STEP,
+                    style("Using Claude for semantic search").dim(),
+                    style(format!("({})", claude.model())).dim(),
+                );
+                claude.find_matching_commit(&commits, &intent)?
+            } else {
+                println!(
+                    "{} {} {}",
+                    WARN,
+                    style("ANTHROPIC_API_KEY not set — using keyword fallback.").yellow(),
+                    style("Set it for semantic search.").dim(),
+                );
+                keyword_search(&commits, &intent).map(|c| c.oid.clone())
+            };
+
+            let oid_str = match matched_oid {
+                Some(o) => o,
+                None => {
+                    println!(
+                        "{} No commit found matching: \"{}\"",
+                        WARN,
+                        style(&intent).yellow()
+                    );
+                    return Ok(());
+                }
+            };
+
+            let oid = Oid::from_str(&oid_str)?;
+            let commit = repo.git().find_commit(oid)?;
+            let record = repo.load_h5i_record(oid).ok();
+
+            println!("\n{}", style("Matched commit:").bold().underlined());
+            println!(
+                "  {} {}",
+                style("commit").yellow(),
+                style(&oid_str).magenta().bold()
+            );
+            println!(
+                "  {:<10} {}",
+                style("Message:").dim(),
+                commit.message().unwrap_or("").trim()
+            );
+            if let Some(ref r) = record {
+                if let Some(ref ai) = r.ai_metadata {
+                    if !ai.agent_id.is_empty() {
+                        println!(
+                            "  {:<10} {} {}",
+                            style("Agent:").dim(),
+                            style(&ai.agent_id).cyan(),
+                            style(format!("({})", ai.model_name)).dim(),
+                        );
+                    }
+                    if !ai.prompt.is_empty() {
+                        println!(
+                            "  {:<10} \"{}\"",
+                            style("Prompt:").dim(),
+                            style(&ai.prompt).italic()
+                        );
+                    }
+                }
+                println!(
+                    "  {:<10} {}",
+                    style("Date:").dim(),
+                    r.timestamp.format("%Y-%m-%d %H:%M UTC")
+                );
+            }
+
+            if dry_run {
+                println!(
+                    "\n{} {}",
+                    style("--dry-run").bold(),
+                    style("No changes made.").dim()
+                );
+                return Ok(());
+            }
+
+            if !yes {
+                print!("\n{} [y/N] ", style("Revert this commit?").bold());
+                use std::io::Write as _;
+                std::io::stdout().flush()?;
+                let mut input = String::new();
+                std::io::stdin().read_line(&mut input)?;
+                if !input.trim().eq_ignore_ascii_case("y") {
+                    println!("{} Aborted.", style("!").dim());
+                    return Ok(());
+                }
+            }
+
+            let new_oid = repo.revert_commit(oid)?;
+            println!(
+                "{} {} {}",
+                SUCCESS,
+                style("Revert commit created:").green(),
+                style(new_oid).magenta().bold()
+            );
+        }
+
+        Commands::InstallHooks => {
+            let hook_script = r#"#!/usr/bin/env bash
+# h5i Claude Code hook — writes the user prompt to .git/.h5i/pending_context.json
+# so that `h5i commit` can pick it up automatically without --prompt.
+set -euo pipefail
+GIT_ROOT=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
+H5I_DIR="$GIT_ROOT/.git/.h5i"
+[ -d "$H5I_DIR" ] || exit 0
+jq -c '{
+  prompt: .prompt,
+  model: (env.H5I_MODEL // "claude-sonnet-4-6"),
+  agent_id: (env.H5I_AGENT_ID // "claude-code"),
+  session_id: .session_id
+}' > "$H5I_DIR/pending_context.json"
+"#;
+
+            println!("{}", style("── Step 1: Save hook script ──").bold());
+            println!(
+                "Save the following script to {} and make it executable:\n",
+                style("~/.claude/hooks/h5i-capture-prompt.sh").yellow()
+            );
+            println!("{}", style(hook_script).dim());
+
+            println!("{}", style("── Step 2: Add to ~/.claude/settings.json ──").bold());
+            println!(
+                "Add (or merge) the {} block into your {}:\n",
+                style("hooks").yellow(),
+                style("~/.claude/settings.json").yellow()
+            );
+            println!(
+                "{}",
+                style(
+                    r#"{
+  "hooks": {
+    "UserPromptSubmit": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "~/.claude/hooks/h5i-capture-prompt.sh"
+          }
+        ]
+      }
+    ]
+  }
+}"#
+                )
+                .dim()
+            );
+
+            println!(
+                "\n{} {} {} {}",
+                style("Tip:").bold(),
+                "Set",
+                style("H5I_MODEL").yellow(),
+                "and",
+            );
+            println!(
+                "    {} in your shell profile to override the defaults captured by the hook.",
+                style("H5I_AGENT_ID").yellow()
+            );
+            println!(
+                "\n{} {} {} {}",
+                style("Env vars").bold(),
+                "also work without hooks —",
+                style("H5I_PROMPT").yellow() ,
+                "/ H5I_MODEL / H5I_AGENT_ID are read automatically at commit time."
+            );
         }
 
         Commands::Resolve { ours, theirs, file } => {

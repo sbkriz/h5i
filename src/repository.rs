@@ -13,8 +13,11 @@ use yrs::{GetString, Text, Transact};
 use crate::blame::{BlameMode, BlameResult};
 use crate::delta_store::{sha256_hash, DeltaStore};
 use crate::error::H5iError;
+use chrono::{TimeZone, Utc};
+
 use crate::metadata::{
-    AiMetadata, H5iCommitRecord, IntegrityLevel, IntegrityReport, TestMetrics, TokenUsage,
+    AiMetadata, CommitSummary, H5iCommitRecord, IntegrityLevel, IntegrityReport, PendingContext,
+    TestMetrics, TokenUsage,
 };
 use crate::LocalSession;
 
@@ -1010,6 +1013,228 @@ impl H5iRepository {
         &self.h5i_root
     }
 
+    /// Reads the pending AI context written by a Claude Code hook.
+    ///
+    /// Returns `None` if no pending context file exists.
+    /// Returns a closure that parses a source file into an s-expression string.
+    ///
+    /// Language detection is based on file extension. The appropriate parser
+    /// script is discovered by searching, in order:
+    ///   1. `$H5I_PARSER_DIR`
+    ///   2. `<repo_workdir>/script/`
+    ///   3. Directory containing the current executable (`../script/`)
+    ///
+    /// Currently supported extensions: `.py` (via `h5i-py-parser.py`).
+    pub fn make_ast_parser(&self) -> Box<dyn Fn(&std::path::Path) -> Option<String>> {
+        let workdir = self.git_repo.workdir().map(|p| p.to_path_buf());
+
+        Box::new(move |path: &std::path::Path| {
+            let ext = path.extension()?.to_str()?;
+
+            // Resolve the script path for the detected language.
+            let script_name = match ext {
+                "py" => "h5i-py-parser.py",
+                _ => return None,
+            };
+
+            let script_path = find_parser_script(script_name, workdir.as_deref())?;
+
+            let output = std::process::Command::new("python3")
+                .arg(&script_path)
+                .arg(path)
+                .output()
+                .ok()?;
+
+            if output.status.success() {
+                String::from_utf8(output.stdout)
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            } else {
+                None
+            }
+        })
+    }
+
+    /// Computes the structural (AST-level) diff for `path` between two versions.
+    ///
+    /// - `from_oid`: the "old" commit (defaults to `HEAD`).
+    /// - `to_oid`:   the "new" commit (defaults to the working-tree file).
+    ///
+    /// For each version, the method first tries the stored AST sidecar, then
+    /// falls back to parsing the file content on-the-fly via `make_ast_parser`.
+    pub fn diff_ast(
+        &self,
+        path: &std::path::Path,
+        from_oid: Option<Oid>,
+        to_oid: Option<Oid>,
+    ) -> Result<crate::ast::AstDiff, H5iError> {
+        use crate::ast::SemanticAst;
+
+        let parser = self.make_ast_parser();
+
+        let from_sexp = {
+            let oid = match from_oid {
+                Some(o) => o,
+                None => self.get_head_commit()?.id(),
+            };
+            self.load_ast_at_commit(oid, path, &*parser)?
+        };
+
+        let to_sexp = match to_oid {
+            Some(oid) => self.load_ast_at_commit(oid, path, &*parser)?,
+            None => {
+                // Parse the working-tree file directly.
+                let abs = self
+                    .git_repo
+                    .workdir()
+                    .ok_or_else(|| H5iError::InvalidPath("bare repository".into()))?
+                    .join(path);
+                parser(&abs).ok_or_else(|| {
+                    H5iError::Ast(format!(
+                        "No parser available for '{}'. \
+                         Ensure python3 and the parser script are accessible.",
+                        path.display()
+                    ))
+                })?
+            }
+        };
+
+        let base = SemanticAst::from_sexp(&from_sexp);
+        let head = SemanticAst::from_sexp(&to_sexp);
+        Ok(base.diff(&head))
+    }
+
+    /// Retrieves the s-expression for `path` at `oid`.
+    ///
+    /// Lookup order:
+    ///   1. Stored AST sidecar (if the commit was made with `--ast`)
+    ///   2. On-the-fly parse of the blob content via `parser`
+    fn load_ast_at_commit(
+        &self,
+        oid: Oid,
+        path: &std::path::Path,
+        parser: &dyn Fn(&std::path::Path) -> Option<String>,
+    ) -> Result<String, H5iError> {
+        let path_str = path.to_str().unwrap_or("");
+
+        // Fast path: use the stored sidecar if available.
+        if let Ok(record) = self.load_h5i_record(oid) {
+            if let Some(hashes) = &record.ast_hashes {
+                if let Some(hash) = hashes.get(path_str) {
+                    let sidecar = self.h5i_root.join("ast").join(format!("{}.sexp", hash));
+                    if let Ok(sexp) = fs::read_to_string(&sidecar) {
+                        return Ok(sexp);
+                    }
+                }
+            }
+        }
+
+        // Slow path: extract blob content and parse on-the-fly.
+        let content = self.get_content_at_oid(oid, path)?;
+        let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("txt");
+        let tmp = self.h5i_root.join(format!("_tmp_ast.{}", ext));
+        fs::write(&tmp, &content)?;
+        let result = parser(&tmp);
+        let _ = fs::remove_file(&tmp);
+
+        result.ok_or_else(|| {
+            H5iError::Ast(format!(
+                "No parser available for '{}' at commit {}",
+                path.display(),
+                oid
+            ))
+        })
+    }
+
+    pub fn read_pending_context(&self) -> Result<Option<PendingContext>, H5iError> {
+        let path = self.h5i_root.join("pending_context.json");
+        if !path.exists() {
+            return Ok(None);
+        }
+        let raw = fs::read_to_string(&path)?;
+        let ctx: PendingContext = serde_json::from_str(&raw)
+            .map_err(|e| H5iError::Metadata(format!("Failed to parse pending_context.json: {e}")))?;
+        Ok(Some(ctx))
+    }
+
+    /// Deletes the pending context file after it has been consumed by a commit.
+    pub fn clear_pending_context(&self) -> Result<(), H5iError> {
+        let path = self.h5i_root.join("pending_context.json");
+        if path.exists() {
+            fs::remove_file(&path)?;
+        }
+        Ok(())
+    }
+
+    /// Returns a list of commits enriched with h5i AI metadata, suitable for
+    /// intent-based search. Commits without h5i records are included but will
+    /// have `None` for prompt/model/agent_id.
+    pub fn list_ai_commits(&self, limit: usize) -> Result<Vec<CommitSummary>, H5iError> {
+        let mut revwalk = self.git_repo.revwalk()?;
+        revwalk.push_head()?;
+
+        let mut results = Vec::new();
+        for oid in revwalk.take(limit) {
+            let oid = oid?;
+            let commit = self.git_repo.find_commit(oid)?;
+            let message = commit.message().unwrap_or("").to_string();
+
+            let record = self.load_h5i_record(oid).ok();
+
+            let (prompt, model, agent_id) = match record.as_ref().and_then(|r| r.ai_metadata.as_ref()) {
+                Some(ai) => (
+                    Some(ai.prompt.clone()).filter(|p| !p.is_empty()),
+                    Some(ai.model_name.clone()).filter(|m| !m.is_empty()),
+                    Some(ai.agent_id.clone()).filter(|a| !a.is_empty()),
+                ),
+                None => (None, None, None),
+            };
+
+            let timestamp = record
+                .map(|r| r.timestamp)
+                .unwrap_or_else(|| {
+                    Utc.timestamp_opt(commit.time().seconds(), 0)
+                        .single()
+                        .unwrap_or_else(Utc::now)
+                });
+
+            results.push(CommitSummary {
+                oid: oid.to_string(),
+                message,
+                prompt,
+                model,
+                agent_id,
+                timestamp,
+            });
+        }
+        Ok(results)
+    }
+
+    /// Creates a revert commit for the given OID using `git revert --no-edit`.
+    /// Returns the OID of the newly created revert commit.
+    pub fn revert_commit(&self, oid: Oid) -> Result<Oid, H5iError> {
+        let workdir = self
+            .git_repo
+            .workdir()
+            .ok_or_else(|| H5iError::InvalidPath("Cannot revert in a bare repository".into()))?;
+
+        let output = std::process::Command::new("git")
+            .args(["revert", "--no-edit", &oid.to_string()])
+            .current_dir(workdir)
+            .output()
+            .map_err(H5iError::Io)?;
+
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            return Err(H5iError::Git(git2::Error::from_str(&format!(
+                "git revert failed: {stderr}"
+            ))));
+        }
+
+        Ok(self.git_repo.head()?.peel_to_commit()?.id())
+    }
+
     /// Resolves the current `HEAD` reference and returns the associated commit.
     ///
     /// This method resolves symbolic references and ensures that the
@@ -1254,126 +1479,93 @@ impl H5iRepository {
     }
 }
 
-// src/repository.rs
-
 impl H5iRepository {
-    /// Detailed integrity check comparing intent (prompt/message) vs actual diff.
-    /// Priority: Prompt > Commit Message.
+    /// Runs all integrity rules against the staged diff and returns a report.
+    ///
+    /// Priority for "intent": prompt (if supplied) > commit message.
+    /// Scoring: each Violation costs −0.4, each Warning −0.15; score is clamped to [0, 1].
     pub fn verify_integrity(
         &self,
         prompt: Option<&str>,
         message: &str,
     ) -> Result<IntegrityReport, H5iError> {
-        let mut findings = Vec::new();
-        let mut penalty: f32 = 0.0;
+        use crate::metadata::Severity;
+        use crate::rules::DiffContext;
+        use crate::rules::run_all_rules;
 
-        // 1. Identify Primary Intent
-        // If a prompt exists, it's our "contract". Otherwise, use the message.
-        let primary_intent = prompt.unwrap_or(message).to_lowercase();
+        let primary_intent = prompt.unwrap_or(message).to_string();
 
-        // 2. Extract staged diff statistics
         let diff = self.get_staged_diff()?;
         let stats = diff.stats()?;
-        let deletions = stats.deletions();
-        let insertions = stats.insertions();
+        let ctx = DiffContext::from_diff(&diff, primary_intent, stats.insertions(), stats.deletions())?;
 
-        // Check A: Unintended Deletions
-        // High penalty if the AI deletes significant code without "delete/remove/cleanup" keywords.
-        let deletion_keywords = ["delete", "remove", "cleanup", "rm", "drop", "refactor"];
-        let has_deletion_intent = deletion_keywords
-            .iter()
-            .any(|&k| primary_intent.contains(k));
+        let findings = run_all_rules(&ctx);
 
-        if deletions > 5 && !has_deletion_intent {
-            findings.push(format!(
-                "High Risk: {} lines deleted, but no deletion intent found in prompt/message.",
-                deletions
-            ));
-            penalty += 0.5;
-        }
+        let violations = findings.iter().filter(|f| f.severity == Severity::Violation).count();
+        let warnings   = findings.iter().filter(|f| f.severity == Severity::Warning).count();
 
-        // Check B: Scope Mismatch (File Path check)
-        // If the prompt mentions a specific file, check if changes leaked into other files.
-        let changed_files = self.get_changed_file_names(&diff)?;
-        for path in &changed_files {
-            let file_name = Path::new(path)
-                .file_name()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
+        let penalty = (violations as f32 * 0.4 + warnings as f32 * 0.15).min(1.0);
+        let score = 1.0 - penalty;
 
-            // Heuristic: If prompt mentions "main.rs" but we see changes in "auth.rs"
-            if changed_files.len() > 1 && !primary_intent.contains(&file_name) {
-                // Low penalty per file to account for shared headers/imports
-                findings.push(format!(
-                    "Scope Warning: File '{}' modified but not explicitly mentioned in intent.",
-                    path
-                ));
-                penalty += 0.1;
-            }
-
-            if path.ends_with("Cargo.toml") && !primary_intent.contains("dependency") {
-                findings.push(format!(
-                    "Scope Warning: File '{}' modified but dependency update is not explicitly mentioned in intent.",
-                    path
-                ));
-                penalty += 0.2;
-            }
-        }
-
-        // Check C: "Refactor" Hallucination
-        // "Refactor" or "Comment" should generally have a balanced Ins/Del ratio.
-        if (primary_intent.contains("refactor") || primary_intent.contains("comment"))
-            && insertions > 100
-            && deletions < 10
-        {
-            findings.push(
-                "Anomaly: Large insertion detected for a 'refactor' or 'comment' task.".to_string(),
-            );
-            penalty += 0.3;
-        }
-
-        // --- Scoring ---
-        let score = (1.0 - penalty).max(0.0);
-        let level = if score < 0.4 {
+        let level = if violations > 0 {
             IntegrityLevel::Violation
-        } else if score < 0.8 {
+        } else if warnings > 0 {
             IntegrityLevel::Warning
         } else {
             IntegrityLevel::Valid
         };
 
-        Ok(IntegrityReport {
-            level,
-            score,
-            findings,
-        })
+        Ok(IntegrityReport { level, score, findings })
     }
 
-    /// Helper to get diff between Git index and HEAD.
     fn get_staged_diff(&'_ self) -> Result<git2::Diff<'_>, H5iError> {
         let head_tree = self.get_head_commit()?.tree()?;
         let index = self.git_repo.index()?;
         let mut opts = git2::DiffOptions::new();
-
         let diff =
             self.git_repo
                 .diff_tree_to_index(Some(&head_tree), Some(&index), Some(&mut opts))?;
         Ok(diff)
     }
+}
 
-    /// Helper to extract file names from a diff object
-    fn get_changed_file_names(&self, diff: &git2::Diff) -> Result<Vec<String>, H5iError> {
-        let mut files = Vec::new();
-        diff.print(git2::DiffFormat::NameOnly, |_delta, _hunk, line| {
-            let path = std::str::from_utf8(line.content()).unwrap_or("").trim();
-            if !path.is_empty() {
-                files.push(path.to_string());
-            }
-            true
-        })?;
-        Ok(files)
+// ── Parser script discovery ───────────────────────────────────────────────────
+
+/// Searches for `script_name` in the standard locations and returns the first
+/// path that exists.
+fn find_parser_script(script_name: &str, workdir: Option<&std::path::Path>) -> Option<std::path::PathBuf> {
+    // 1. Explicit override via environment variable.
+    if let Ok(dir) = std::env::var("H5I_PARSER_DIR") {
+        let p = std::path::Path::new(&dir).join(script_name);
+        if p.exists() {
+            return Some(p);
+        }
     }
+
+    // 2. `script/` inside the repository working directory.
+    if let Some(wd) = workdir {
+        let p = wd.join("script").join(script_name);
+        if p.exists() {
+            return Some(p);
+        }
+    }
+
+    // 3. Relative to the h5i binary (`<bin_dir>/../script/` for development builds,
+    //    `<bin_dir>/script/` for flat installs).
+    if let Ok(exe) = std::env::current_exe() {
+        if let Some(bin_dir) = exe.parent() {
+            for candidate in &[
+                bin_dir.join("script").join(script_name),
+                bin_dir.join("..").join("script").join(script_name),
+            ] {
+                if candidate.exists() {
+                    return Some(candidate.clone());
+                }
+            }
+        }
+    }
+
+    None
 }
 
 #[cfg(test)]
