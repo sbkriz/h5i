@@ -62,7 +62,13 @@ Line-level and AST-level blame that surfaces the original AI prompt and test sta
 
 ## 3. Installation
 
-Requires Rust 1.70+ and an existing Git repository.
+Requires Rust 1.70+:
+
+```bash
+cargo install --git https://github.com/Koukyosyumei/h5i h5i-core
+```
+
+Alternatively, you can install it from a local clone:
 
 ```bash
 git clone https://github.com/koukyosyumei/h5i
