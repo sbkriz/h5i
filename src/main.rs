@@ -16,6 +16,16 @@ use h5i_core::session::LocalSession;
 use h5i_core::ui::{ERROR, LOOKING, STEP, SUCCESS, WARN};
 use h5i_core::watcher::start_h5i_watcher;
 
+/// Truncate a string to at most `max_chars` characters, appending `…` if cut.
+fn truncate(s: &str, max_chars: usize) -> String {
+    let mut chars = s.chars();
+    let mut result: String = chars.by_ref().take(max_chars).collect();
+    if chars.next().is_some() {
+        result.push('…');
+    }
+    result
+}
+
 #[derive(Parser)]
 #[command(name = "h5i", about = "Advanced Git for the AI Era", version)]
 struct Cli {
@@ -53,7 +63,11 @@ enum Commands {
         #[arg(long)]
         agent: Option<String>,
 
-        /// Scan staged source files for `// h5_i_test_start` / `// h5_i_test_end` markers
+        /// Run the test suite and capture metrics.
+        /// If the `H5I_TEST_CMD` environment variable is set, that command is executed
+        /// and its output is parsed for test results (pass/fail counts, duration, etc.).
+        /// Falls back to scanning staged source files for `// h5_i_test_start` /
+        /// `// h5_i_test_end` markers when no command is configured.
         #[arg(long)]
         tests: bool,
 
@@ -91,6 +105,13 @@ enum Commands {
         /// Number of recent commits to display
         #[arg(short, long, default_value_t = 10)]
         limit: usize,
+
+        /// Show the full prompt ancestry chain for a specific line.
+        /// Format: <file>:<line>  e.g.  src/model.py:42
+        /// Prints every commit that ever touched that line, annotated with the
+        /// human prompt that caused each change.
+        #[arg(long, value_name = "FILE:LINE")]
+        ancestry: Option<String>,
     },
 
     /// Analyze file ownership with optional structural (AST) logic
@@ -101,6 +122,12 @@ enum Commands {
         /// Mode of blame: 'line' (standard) or 'ast' (semantic)
         #[arg(short, long, default_value = "line")]
         mode: String,
+
+        /// Annotate each commit boundary with the human prompt that triggered it.
+        /// The prompt is printed once per unique commit, immediately after the
+        /// last line belonging to that commit.
+        #[arg(long)]
+        show_prompt: bool,
     },
 
     /// Resolve branch conflicts using CRDT-based semantic merging
@@ -200,6 +227,12 @@ enum NotesCommands {
         /// Commit OID to link this analysis to (default: HEAD)
         #[arg(long)]
         commit: Option<String>,
+        /// Only include session events that occurred *after* this commit was made.
+        /// Useful when a single Claude Code session spans multiple h5i commits:
+        ///   h5i notes analyze --since <first-commit-sha>
+        /// links only the work done *after* that commit to HEAD.
+        #[arg(long, value_name = "OID")]
+        since: Option<String>,
     },
 
     /// Show which files the AI consulted vs edited for a given commit
@@ -792,9 +825,11 @@ fn main() -> anyhow::Result<()> {
             //   1. --test-results <file>
             //   2. H5I_TEST_RESULTS env var (path to a JSON file)
             //   3. --test-cmd <cmd>
-            //   4. --tests flag (scan staged files for markers)
-            //   5. Nothing
+            //   4. --tests + H5I_TEST_CMD env var (run configured command)
+            //   5. --tests alone (scan staged files for markers)
+            //   6. Nothing
             let env_results = std::env::var("H5I_TEST_RESULTS").ok();
+            let env_test_cmd = std::env::var("H5I_TEST_CMD").ok();
             let test_source = if let Some(ref path) = test_results {
                 let metrics = repo.load_test_results_from_file(path)?;
                 TestSource::Provided(metrics)
@@ -809,17 +844,34 @@ fn main() -> anyhow::Result<()> {
                 );
                 let metrics = repo.run_test_command(cmd)?;
                 let passing = metrics.is_passing();
-                let icon = if passing {
-                    style("✔").green()
-                } else {
-                    style("✖").red()
-                };
+                let icon = if passing { style("✔").green() } else { style("✖").red() };
                 if let Some(ref s) = metrics.summary {
                     println!("  {} {}", icon, style(s).dim());
                 }
                 TestSource::Provided(metrics)
             } else if tests {
-                TestSource::ScanMarkers
+                if let Some(ref cmd) = env_test_cmd {
+                    // --tests + H5I_TEST_CMD: actually run the test suite
+                    println!(
+                        "{} Running test command (H5I_TEST_CMD): {}",
+                        style("▶").cyan(),
+                        style(cmd).yellow()
+                    );
+                    let metrics = repo.run_test_command(cmd)?;
+                    let passing = metrics.is_passing();
+                    let icon = if passing { style("✔").green() } else { style("✖").red() };
+                    if let Some(ref s) = metrics.summary {
+                        println!("  {} {}", icon, style(s).dim());
+                    } else {
+                        let status = if passing { "passed" } else { "failed" };
+                        println!("  {} exit code: {}", icon,
+                            metrics.exit_code.map(|c| c.to_string()).unwrap_or_else(|| status.into()));
+                    }
+                    TestSource::Provided(metrics)
+                } else {
+                    // Fallback: scan staged files for marker blocks
+                    TestSource::ScanMarkers
+                }
             } else {
                 TestSource::None
             };
@@ -843,12 +895,82 @@ fn main() -> anyhow::Result<()> {
             );
         }
 
-        Commands::Log { limit } => {
+        Commands::Log { limit, ancestry } => {
             let repo = H5iRepository::open(".")?;
-            repo.print_log(limit)?;
+
+            if let Some(spec) = ancestry {
+                // ── Prompt ancestry mode ──────────────────────────────────────
+                // Parse "file:line" spec.
+                let (file_part, line_part) = spec
+                    .rsplit_once(':')
+                    .ok_or_else(|| anyhow::anyhow!(
+                        "--ancestry expects FILE:LINE format, e.g. src/model.py:42"
+                    ))?;
+                let line_number: usize = line_part.parse().map_err(|_| {
+                    anyhow::anyhow!("--ancestry: '{}' is not a valid line number", line_part)
+                })?;
+                let path = std::path::Path::new(file_part);
+
+                println!(
+                    "\n{} {}\n",
+                    style("──").dim(),
+                    style(format!("Prompt ancestry for {}:{}", file_part, line_number))
+                        .cyan()
+                        .bold(),
+                );
+
+                let chain = repo.blame_ancestry(path, line_number)?;
+
+                if chain.is_empty() {
+                    println!("  (no ancestry found — file may be untracked or line out of range)");
+                } else {
+                    let total = chain.len();
+                    for (i, entry) in chain.iter().enumerate() {
+                        let depth = total - i;
+                        let short_oid = &entry.commit_id[..8];
+                        let ts = entry.timestamp.format("%Y-%m-%d %H:%M UTC");
+                        let agent_label = match &entry.agent {
+                            Some(a) => format!("AI:{a}"),
+                            None => "Human".to_string(),
+                        };
+
+                        println!(
+                            "  [{}] {}  {} · {}",
+                            style(format!("{depth} of {total}")).dim(),
+                            style(short_oid).magenta(),
+                            style(&entry.author).cyan(),
+                            style(ts).dim(),
+                        );
+
+                        // The line content at this point in history
+                        println!(
+                            "       {}  {}",
+                            style("line:").dim(),
+                            style(&entry.line_content).italic(),
+                        );
+
+                        match &entry.prompt {
+                            Some(p) => println!(
+                                "       {}  {}",
+                                style("prompt:").dim(),
+                                style(format!("\"{}\"", truncate(p, 80))).yellow().italic(),
+                            ),
+                            None => println!(
+                                "       {}  {} ({})",
+                                style("prompt:").dim(),
+                                style("(none recorded)").dim(),
+                                style(agent_label).dim(),
+                            ),
+                        }
+                        println!();
+                    }
+                }
+            } else {
+                repo.print_log(limit)?;
+            }
         }
 
-        Commands::Blame { file, mode } => {
+        Commands::Blame { file, mode, show_prompt } => {
             let repo = H5iRepository::open(".")?;
             let blame_mode = if mode.to_lowercase() == "ast" {
                 BlameMode::Ast
@@ -867,7 +989,11 @@ fn main() -> anyhow::Result<()> {
                 .underlined()
             );
 
-            for r in results {
+            // Track the previous commit id so we can print the prompt once per
+            // commit boundary rather than once per line.
+            let mut prev_commit: Option<String> = None;
+
+            for r in &results {
                 let test_indicator = match r.test_passed {
                     Some(true) => "✅",
                     Some(false) => "❌",
@@ -875,12 +1001,30 @@ fn main() -> anyhow::Result<()> {
                 };
                 let semantic_indicator = if r.is_semantic_change { "✨" } else { "  " };
 
+                // Print prompt annotation when the commit changes (show_prompt mode).
+                if show_prompt {
+                    let commit_changed = prev_commit.as_deref() != Some(&r.commit_id);
+                    if commit_changed {
+                        if let Some(ref prompt) = r.prompt {
+                            // Blank separator + indented prompt label
+                            println!(
+                                "           {:<15}   {}",
+                                "",
+                                style(format!("prompt: \"{}\"", truncate(prompt, 72)))
+                                    .italic()
+                                    .yellow()
+                            );
+                        }
+                        prev_commit = Some(r.commit_id.clone());
+                    }
+                }
+
                 println!(
                     "{} {} {} {:<15} | {}",
                     test_indicator,
                     semantic_indicator,
                     style(&r.commit_id[..8]).dim(),
-                    style(r.agent_info).blue(),
+                    style(&r.agent_info).blue(),
                     r.line_content
                 );
             }
@@ -1067,7 +1211,7 @@ fn main() -> anyhow::Result<()> {
         }
 
         Commands::Notes { action } => match action {
-            NotesCommands::Analyze { session, commit } => {
+            NotesCommands::Analyze { session, commit, since } => {
                 let repo = H5iRepository::open(".")?;
                 let workdir = repo
                     .git()
@@ -1095,10 +1239,37 @@ fn main() -> anyhow::Result<()> {
                         }
                     },
                 };
+
+                // Resolve --since to a UTC timestamp so analyze_session can filter events.
+                let since_time: Option<chrono::DateTime<chrono::Utc>> = match since {
+                    None => None,
+                    Some(ref sha) => {
+                        let oid = git2::Oid::from_str(sha)
+                            .or_else(|_| -> Result<git2::Oid, git2::Error> {
+                                repo.git()
+                                    .revparse_single(sha)?
+                                    .peel_to_commit()
+                                    .map(|c| c.id())
+                            })
+                            .map_err(|e| anyhow::anyhow!("--since: cannot resolve '{}': {}", sha, e))?;
+                        let c = repo.git().find_commit(oid)
+                            .map_err(|e| anyhow::anyhow!("--since: {}", e))?;
+                        let secs = c.time().seconds();
+                        chrono::DateTime::from_timestamp(secs, 0)
+                            .map(|dt| {
+                                println!("{} Filtering session to events after {} ({})",
+                                    STEP,
+                                    style(&sha[..8.min(sha.len())]).magenta(),
+                                    style(dt.format("%Y-%m-%d %H:%M UTC")).dim());
+                                dt
+                            })
+                    }
+                };
+
                 println!("{} {} → commit {}", STEP,
                     style("Analyzing session log").cyan().bold(),
                     style(&oid_str[..8.min(oid_str.len())]).magenta());
-                let analysis = session_log::analyze_session(&jsonl_path)?;
+                let analysis = session_log::analyze_session(&jsonl_path, since_time)?;
                 session_log::save_analysis(&repo.h5i_root, &oid_str, &analysis)?;
                 println!("{} {} messages · {} tool calls · {} edited · {} consulted",
                     SUCCESS,
