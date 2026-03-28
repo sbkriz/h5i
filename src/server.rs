@@ -10,9 +10,11 @@ use axum::{
 use serde::{Deserialize, Serialize};
 use tokio::net::TcpListener;
 
+use crate::memory;
 use crate::metadata::{IntegrityReport, IntentGraph};
 use crate::repository::H5iRepository;
 use crate::review::{ReviewPoint, REVIEW_THRESHOLD};
+use crate::session_log;
 
 // ── Shared state ─────────────────────────────────────────────────────────────
 
@@ -82,6 +84,51 @@ pub struct IntentGraphQuery {
 pub struct ReviewQuery {
     pub limit: Option<usize>,
     pub min_score: Option<f32>,
+}
+
+#[derive(Deserialize)]
+pub struct MemoryDiffQuery {
+    pub from: String,
+    /// OID of the second snapshot; omit to diff against live memory.
+    pub to: Option<String>,
+}
+
+// ── Memory API response types ─────────────────────────────────────────────────
+
+#[derive(Serialize, Clone)]
+pub struct MemoryFileEntry {
+    pub name: String,
+    pub content: String,
+}
+
+#[derive(Serialize)]
+pub struct MemorySnapshotResponse {
+    pub commit_oid: String,
+    pub short_oid: String,
+    pub timestamp: String,
+    pub file_count: usize,
+    pub files: Vec<MemoryFileEntry>,
+}
+
+#[derive(Serialize)]
+pub struct DiffLineResponse {
+    pub kind: String, // "context" | "added" | "removed"
+    pub text: String,
+}
+
+#[derive(Serialize)]
+pub struct ModifiedFileResponse {
+    pub name: String,
+    pub hunks: Vec<DiffLineResponse>,
+}
+
+#[derive(Serialize, Default)]
+pub struct MemoryDiffResponse {
+    pub from_label: String,
+    pub to_label: String,
+    pub added_files: Vec<MemoryFileEntry>,
+    pub removed_files: Vec<String>,
+    pub modified_files: Vec<ModifiedFileResponse>,
 }
 
 // ── Helpers ───────────────────────────────────────────────────────────────────
@@ -354,6 +401,176 @@ async fn api_review_points(
     )
 }
 
+// ── Memory handlers ───────────────────────────────────────────────────────────
+
+async fn api_memory_snapshots(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<MemorySnapshotResponse>> {
+    let path = state.repo_path.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<Vec<MemorySnapshotResponse>> {
+        let repo = H5iRepository::open(&path)?;
+        let snapshots = memory::list_snapshots(&repo.h5i_root)?;
+        let mut out = Vec::new();
+        for snap in snapshots.iter().rev() {
+            let snap_dir = repo.h5i_root.join("memory").join(&snap.commit_oid);
+            let mut files: Vec<MemoryFileEntry> = std::fs::read_dir(&snap_dir)
+                .map(|rd| {
+                    rd.filter_map(|e| e.ok())
+                        .filter(|e| {
+                            e.path().is_file()
+                                && e.file_name() != "_meta.json"
+                        })
+                        .map(|e| MemoryFileEntry {
+                            name: e.file_name().to_string_lossy().into_owned(),
+                            content: std::fs::read_to_string(e.path()).unwrap_or_default(),
+                        })
+                        .collect()
+                })
+                .unwrap_or_default();
+            files.sort_by(|a, b| a.name.cmp(&b.name));
+            out.push(MemorySnapshotResponse {
+                short_oid: snap.commit_oid[..8.min(snap.commit_oid.len())].to_string(),
+                commit_oid: snap.commit_oid.clone(),
+                timestamp: snap.timestamp.to_rfc3339(),
+                file_count: snap.file_count,
+                files,
+            });
+        }
+        Ok(out)
+    })
+    .await;
+    Json(result.unwrap_or_else(|_| Ok(vec![])).unwrap_or_default())
+}
+
+async fn api_memory_diff(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<MemoryDiffQuery>,
+) -> Json<MemoryDiffResponse> {
+    let path = state.repo_path.clone();
+    let from = params.from.clone();
+    let to = params.to.clone();
+    let result = tokio::task::spawn_blocking(move || -> anyhow::Result<MemoryDiffResponse> {
+        let repo = H5iRepository::open(&path)?;
+        let workdir = repo
+            .git()
+            .workdir()
+            .ok_or_else(|| anyhow::anyhow!("bare repository"))?
+            .to_path_buf();
+        let diff =
+            memory::diff_snapshots(&repo.h5i_root, &workdir, &from, to.as_deref())?;
+        Ok(MemoryDiffResponse {
+            from_label: diff.from_label,
+            to_label: diff.to_label,
+            added_files: diff
+                .added_files
+                .into_iter()
+                .map(|(name, content)| MemoryFileEntry { name, content })
+                .collect(),
+            removed_files: diff.removed_files.into_iter().map(|(name, _)| name).collect(),
+            modified_files: diff
+                .modified_files
+                .into_iter()
+                .map(|f| ModifiedFileResponse {
+                    name: f.name,
+                    hunks: f
+                        .hunks
+                        .into_iter()
+                        .map(|l| match l {
+                            memory::DiffLine::Context(t) => {
+                                DiffLineResponse { kind: "context".into(), text: t }
+                            }
+                            memory::DiffLine::Added(t) => {
+                                DiffLineResponse { kind: "added".into(), text: t }
+                            }
+                            memory::DiffLine::Removed(t) => {
+                                DiffLineResponse { kind: "removed".into(), text: t }
+                            }
+                        })
+                        .collect(),
+                })
+                .collect(),
+        })
+    })
+    .await;
+    Json(result.unwrap_or_else(|_| Ok(MemoryDiffResponse::default())).unwrap_or_default())
+}
+
+// ── Session log API ────────────────────────────────────────────────────────────
+
+#[derive(Deserialize)]
+pub struct SessionLogQuery {
+    pub commit: Option<String>,
+    pub file: Option<String>,
+}
+
+async fn api_session_log(
+    State(state): State<Arc<AppState>>,
+    Query(params): Query<SessionLogQuery>,
+) -> Json<Option<session_log::SessionAnalysis>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let repo = H5iRepository::open(&state.repo_path).ok()?;
+        let oid_str = match params.commit {
+            Some(ref s) => s.clone(),
+            None => repo.git().head().ok()?.peel_to_commit().ok()?.id().to_string(),
+        };
+        session_log::load_analysis(&repo.h5i_root, &oid_str).ok().flatten()
+    })
+    .await;
+    Json(result.unwrap_or(None))
+}
+
+async fn api_session_churn(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<session_log::FileChurn>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let repo = H5iRepository::open(&state.repo_path).ok()?;
+        Some(session_log::aggregate_churn(&repo.h5i_root))
+    })
+    .await;
+    Json(result.unwrap_or(None).unwrap_or_default())
+}
+
+#[derive(Serialize)]
+struct SessionLogMeta {
+    commit_oid: String,
+    session_id: String,
+    analyzed_at: String,
+    message_count: usize,
+    tool_call_count: usize,
+    edited_count: usize,
+    consulted_count: usize,
+    uncertainty_count: usize,
+}
+
+async fn api_session_list(
+    State(state): State<Arc<AppState>>,
+) -> Json<Vec<SessionLogMeta>> {
+    let result = tokio::task::spawn_blocking(move || {
+        let repo = H5iRepository::open(&state.repo_path).ok()?;
+        let oids = session_log::list_analyses(&repo.h5i_root);
+        let metas: Vec<SessionLogMeta> = oids
+            .iter()
+            .rev()
+            .filter_map(|oid| {
+                let a = session_log::load_analysis(&repo.h5i_root, oid).ok()??;
+                Some(SessionLogMeta {
+                    commit_oid: oid.clone(),
+                    session_id: a.session_id.clone(),
+                    analyzed_at: a.analyzed_at.format("%Y-%m-%d %H:%M UTC").to_string(),
+                    message_count: a.message_count,
+                    tool_call_count: a.tool_call_count,
+                    edited_count: a.footprint.edited.len(),
+                    consulted_count: a.footprint.consulted.len(),
+                    uncertainty_count: a.uncertainty.len(),
+                })
+            })
+            .collect();
+        Some(metas)
+    })
+    .await;
+    Json(result.unwrap_or(None).unwrap_or_default())
+}
+
 // ── Server entry point ────────────────────────────────────────────────────────
 
 pub async fn serve(repo_path: PathBuf, port: u16) -> anyhow::Result<()> {
@@ -367,6 +584,11 @@ pub async fn serve(repo_path: PathBuf, port: u16) -> anyhow::Result<()> {
         .route("/api/integrity/commit", get(api_integrity_commit))
         .route("/api/intent-graph", get(api_intent_graph))
         .route("/api/review-points", get(api_review_points))
+        .route("/api/memory/snapshots", get(api_memory_snapshots))
+        .route("/api/memory/diff", get(api_memory_diff))
+        .route("/api/session-log", get(api_session_log))
+        .route("/api/session-log/list", get(api_session_list))
+        .route("/api/session-log/churn", get(api_session_churn))
         .with_state(state);
 
     let addr = format!("127.0.0.1:{}", port);
@@ -625,6 +847,108 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helveti
 .ig-modal-intent{font-size:14px;color:#e6edf3;line-height:1.55;white-space:pre-wrap;word-break:break-word}
 .ig-modal-meta{display:flex;flex-wrap:wrap;gap:6px;margin-top:8px}
 .ig-modal-badge{padding:2px 9px;border-radius:10px;font-size:11px;font-weight:500}
+
+/* ── Memory tab ────────────────────────────────────────────────────────────── */
+.mem-layout{display:grid;grid-template-columns:300px 1fr;gap:14px;align-items:start}
+.mem-snap-list{display:flex;flex-direction:column;gap:7px}
+.mem-snap-card{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:11px 13px;cursor:pointer;transition:all .15s;position:relative}
+.mem-snap-card:hover{border-color:#484f58;background:#1c2128}
+.mem-snap-card.sel-from{border-color:#58a6ff;box-shadow:0 0 0 1px #58a6ff33}
+.mem-snap-card.sel-to{border-color:#3fb950;box-shadow:0 0 0 1px #3fb95033}
+.mem-snap-head{display:flex;align-items:center;gap:7px;margin-bottom:4px}
+.mem-oid{font-family:monospace;font-size:11px;font-weight:700;background:#bc8cff22;color:#bc8cff;padding:1px 7px;border-radius:4px}
+.mem-ts{font-size:11px;color:#484f58}
+.mem-nfiles{font-size:12px;color:#8b949e}
+.mem-sel-badge{position:absolute;top:8px;right:8px;font-size:9px;font-weight:700;padding:1px 7px;border-radius:8px}
+.mem-sel-from-badge{background:#1f3a5f;color:#58a6ff}
+.mem-sel-to-badge{background:#1a3a2a;color:#3fb950}
+
+.mem-viewer{background:#161b22;border:1px solid #30363d;border-radius:8px;padding:16px;min-height:420px}
+.mem-viewer-empty{color:#484f58;text-align:center;padding:60px 20px;font-size:13px;line-height:1.8}
+
+.mem-file-tabs{display:flex;gap:4px;flex-wrap:wrap;margin-bottom:12px;border-bottom:1px solid #30363d;padding-bottom:8px}
+.mem-ftab{background:none;border:1px solid transparent;border-radius:4px;padding:3px 10px;font-size:11px;cursor:pointer;color:#8b949e;transition:all .15s}
+.mem-ftab:hover{color:#e6edf3;background:#21262d}
+.mem-ftab.active{background:#bc8cff22;border-color:#bc8cff44;color:#bc8cff}
+.mem-file-content{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:12px;font-size:12px;font-family:monospace;white-space:pre-wrap;color:#8b949e;max-height:480px;overflow-y:auto;line-height:1.6}
+
+.mem-frontmatter{background:#0d1117;border:1px solid #21262d;border-radius:6px;padding:10px 14px;margin-bottom:10px}
+.mem-fm-row{display:flex;gap:10px;font-size:12px;margin-bottom:5px;align-items:baseline}
+.mem-fm-key{color:#484f58;min-width:72px;font-family:monospace;font-size:11px}
+.mem-fm-val{color:#e6edf3}
+.mem-fm-desc{color:#8b949e;font-style:italic}
+.mem-type-user{background:#1f3a5f;color:#58a6ff;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700}
+.mem-type-feedback{background:#2d1f4f;color:#bc8cff;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700}
+.mem-type-project{background:#1a3a2a;color:#3fb950;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700}
+.mem-type-reference{background:#3a2a1a;color:#d29922;padding:1px 7px;border-radius:8px;font-size:10px;font-weight:700}
+.mem-body{font-size:12px;color:#e6edf3;white-space:pre-wrap;line-height:1.7;font-family:inherit;padding:2px 0}
+
+.mem-diff-file{margin-bottom:18px}
+.mem-diff-hdr{display:flex;align-items:center;gap:7px;margin-bottom:6px;font-size:12px;font-weight:600;font-family:monospace}
+.mem-diff-hdr-add{color:#3fb950}.mem-diff-hdr-rm{color:#f85149}.mem-diff-hdr-mod{color:#d29922}
+.mem-diff-lines{background:#0d1117;border:1px solid #21262d;border-radius:6px;overflow:hidden;font-family:monospace;font-size:11px;max-height:320px;overflow-y:auto}
+.mem-dl{display:flex;line-height:1.55}
+.mem-dl-add{background:#12261e;color:#3fb950}
+.mem-dl-rm{background:#270d0d;color:#f85149}
+.mem-dl-ctx{color:#484f58}
+.mem-dl-sep{color:#30363d;font-style:italic;background:#0d1117;justify-content:center}
+.mem-gutter{width:18px;text-align:center;flex-shrink:0;padding:0 3px;font-size:10px;user-select:none;border-right:1px solid #21262d;color:inherit;opacity:.7}
+.mem-text{padding:1px 8px;white-space:pre-wrap;word-break:break-all;flex:1}
+
+.mem-diff-summary{display:flex;gap:14px;margin-bottom:14px;font-size:12px;flex-wrap:wrap}
+.mem-diff-stat-add{color:#3fb950;display:flex;align-items:center;gap:4px}
+.mem-diff-stat-rm{color:#f85149;display:flex;align-items:center;gap:4px}
+.mem-diff-stat-mod{color:#d29922;display:flex;align-items:center;gap:4px}
+
+.mem-controls{display:flex;gap:8px;align-items:center;margin-bottom:14px;flex-wrap:wrap}
+.mem-btn{background:linear-gradient(90deg,#bc8cff,#58a6ff);border:none;border-radius:6px;color:#fff;padding:6px 16px;font-size:12px;font-weight:600;cursor:pointer;transition:opacity .15s}
+.mem-btn:hover{opacity:.85}
+.mem-btn:disabled{opacity:.4;cursor:not-allowed}
+.mem-btn-ghost{background:#21262d;border:1px solid #30363d;border-radius:6px;color:#8b949e;padding:6px 14px;font-size:12px;cursor:pointer;transition:all .15s}
+.mem-btn-ghost:hover{color:#e6edf3;border-color:#8b949e}
+.mem-hint{font-size:11px;color:#484f58}
+.mem-snap-count{font-size:11px;color:#484f58;margin-bottom:8px}
+.mem-insp-hdr{font-size:13px;font-weight:600;margin-bottom:12px;color:#e6edf3;display:flex;align-items:center;gap:10px}
+.mem-diff-hdr-row{font-size:13px;font-weight:600;margin-bottom:14px;color:#e6edf3;display:flex;align-items:center;gap:8px}
+/* ── Sessions tab ── */
+.sl-layout{display:grid;grid-template-columns:280px 1fr;gap:16px;height:calc(100vh - 160px)}
+.sl-list{overflow-y:auto;border-right:1px solid #21262d;padding-right:12px}
+.sl-card{background:#161b22;border:1px solid #21262d;border-radius:8px;padding:12px;margin-bottom:8px;cursor:pointer;transition:border-color .15s}
+.sl-card:hover,.sl-card.active{border-color:#58a6ff}
+.sl-card-oid{font-family:monospace;font-size:12px;color:#bc8cff;font-weight:700}
+.sl-card-meta{font-size:11px;color:#484f58;margin-top:4px}
+.sl-card-badges{display:flex;gap:6px;margin-top:6px;flex-wrap:wrap}
+.sl-badge{font-size:10px;padding:2px 7px;border-radius:10px;font-weight:600}
+.sl-badge-edit{background:#1a3a1a;color:#3fb950}
+.sl-badge-read{background:#1a2a3a;color:#58a6ff}
+.sl-badge-warn{background:#3a2a10;color:#e3b341}
+.sl-detail{overflow-y:auto;padding:4px 0 4px 4px}
+.sl-section{margin-bottom:20px}
+.sl-section-title{font-size:12px;font-weight:700;color:#8b949e;text-transform:uppercase;letter-spacing:.08em;margin-bottom:10px;padding-bottom:4px;border-bottom:1px solid #21262d}
+.sl-trigger{background:#161b22;border:1px solid #21262d;border-radius:6px;padding:10px 14px;font-style:italic;color:#58a6ff;font-size:13px;line-height:1.5}
+.sl-file-row{display:flex;align-items:center;gap:8px;padding:4px 0;font-size:12px}
+.sl-file-name{color:#e6edf3;font-family:monospace;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sl-file-count{color:#484f58;font-size:11px;min-width:28px;text-align:right}
+.sl-file-tools{color:#484f58;font-size:10px}
+.sl-edit-icon{color:#3fb950;width:14px;text-align:center}
+.sl-read-icon{color:#58a6ff;width:14px;text-align:center}
+.sl-dep-icon{color:#484f58;width:14px;text-align:center}
+.sl-decision{padding:5px 0;font-size:12px;color:#c9d1d9;line-height:1.5;border-bottom:1px solid #161b22}
+.sl-rejected{padding:5px 0;font-size:12px;color:#484f58;font-style:italic;line-height:1.5}
+.sl-rejected::before{content:"✗ ";color:#f85149}
+.sl-unc-row{margin-bottom:10px;padding:8px 10px;background:#161b22;border-radius:6px;border-left:3px solid #e3b341}
+.sl-unc-row.high{border-left-color:#f85149}
+.sl-unc-row.low{border-left-color:#3fb950}
+.sl-unc-phrase{font-size:11px;font-weight:700;color:#e3b341;margin-bottom:3px}
+.sl-unc-snippet{font-size:11px;color:#8b949e;font-style:italic;line-height:1.4}
+.sl-unc-meta{font-size:10px;color:#484f58;margin-top:3px}
+.sl-churn-bar{display:flex;align-items:center;gap:8px;padding:4px 0}
+.sl-churn-file{font-family:monospace;font-size:12px;color:#e6edf3;flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.sl-churn-track{width:80px;height:6px;background:#21262d;border-radius:3px;overflow:hidden}
+.sl-churn-fill{height:100%;border-radius:3px;background:linear-gradient(90deg,#3fb950,#f85149)}
+.sl-churn-pct{font-size:11px;color:#484f58;min-width:34px;text-align:right}
+.sl-replay-hash{font-family:monospace;font-size:11px;color:#484f58;background:#161b22;padding:6px 10px;border-radius:4px;word-break:break-all}
+.sl-empty{color:#484f58;font-size:13px;padding:20px 0}
 </style>
 </head>
 <body>
@@ -701,6 +1025,8 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helveti
       <button class="tab" onclick="switchTab('integrity')">🛡 Integrity</button>
       <button class="tab" onclick="switchTab('intentgraph')">🔗 Intent Graph</button>
       <button class="tab" onclick="switchTab('review')">🔍 Review Points<span class="tab-badge" id="tab-review-count">—</span></button>
+      <button class="tab" onclick="switchTab('memory');loadMemorySnapshots()">🧠 Memory<span class="tab-badge" id="tab-mem-count">—</span></button>
+      <button class="tab" onclick="switchTab('sessions');loadSessionList()">🔬 Sessions<span class="tab-badge" id="tab-sl-count">—</span></button>
     </div>
 
     <!-- Timeline panel -->
@@ -781,6 +1107,41 @@ body{font-family:-apple-system,BlinkMacSystemFont,"Segoe UI","Noto Sans",Helveti
         <button class="run-btn" id="btn-run" onclick="runIntegrity()">🛡 Run Integrity Check</button>
       </div>
       <div class="int-result" id="int-result"></div>
+    </div>
+
+    <!-- Memory panel -->
+    <div id="panel-memory" style="display:none">
+      <div class="mem-controls">
+        <button class="mem-btn" id="mem-diff-btn" onclick="diffMemory()" disabled>⊕ Diff Selected</button>
+        <button class="mem-btn-ghost" onclick="clearMemSel()">Clear</button>
+        <span class="mem-hint" id="mem-hint">Click a snapshot to inspect · click two to diff</span>
+      </div>
+      <div class="mem-layout">
+        <div>
+          <div class="mem-snap-count" id="mem-snap-count"></div>
+          <div class="mem-snap-list" id="mem-snap-list">
+            <div class="empty-state"><span class="spinner"></span> Loading…</div>
+          </div>
+        </div>
+        <div class="mem-viewer" id="mem-viewer">
+          <div class="mem-viewer-empty">
+            Select a snapshot to inspect its files,<br>
+            or select two snapshots to compare them.
+          </div>
+        </div>
+      </div>
+    </div>
+
+    <!-- Sessions panel -->
+    <div id="panel-sessions" style="display:none">
+      <div class="sl-layout">
+        <div class="sl-list" id="sl-list">
+          <div class="empty-state"><span class="spinner"></span> Loading…</div>
+        </div>
+        <div class="sl-detail" id="sl-detail">
+          <div class="sl-empty">Select a session to inspect its footprint, causal chain, uncertainty signals, and churn.</div>
+        </div>
+      </div>
     </div>
 
     <!-- Review Points panel -->
@@ -1282,7 +1643,7 @@ function renderSparkline() {
 
 // ── Tab switching ──────────────────────────────────────────────────────────
 function switchTab(tab) {
-  ['timeline','summary','integrity','intentgraph','review'].forEach(t => {
+  ['timeline','summary','integrity','intentgraph','review','memory','sessions'].forEach(t => {
     const btn = document.querySelector(`.tab[onclick="switchTab('${t}')"]`);
     const panel = id('panel-' + t);
     const active = t === tab;
@@ -1633,9 +1994,679 @@ function closeNodeModal() {
 
 document.addEventListener('keydown', e => { if (e.key === 'Escape') closeNodeModal(); });
 
+// ── Memory ────────────────────────────────────────────────────────────────
+let memSnapshots = [];
+let memSelFrom = null;
+let memSelTo = null;
+let _memFiles = [];
+
+async function loadMemorySnapshots() {
+  if (memSnapshots.length) return; // already loaded
+  id('mem-snap-list').innerHTML = '<div class="empty-state"><span class="spinner"></span> Loading…</div>';
+  try {
+    memSnapshots = await fetch('/api/memory/snapshots').then(r => r.json());
+    setText('tab-mem-count', memSnapshots.length);
+    setText('mem-snap-count', memSnapshots.length + ' snapshot' + (memSnapshots.length === 1 ? '' : 's'));
+    renderMemList();
+  } catch(e) {
+    id('mem-snap-list').innerHTML = '<div class="empty-state">Failed to load snapshots.</div>';
+  }
+}
+
+function renderMemList() {
+  if (!memSnapshots.length) {
+    id('mem-snap-list').innerHTML = `<div class="empty-state" style="padding:30px 0;text-align:center">
+      No memory snapshots yet.<br><code style="font-size:11px;color:#8b949e">h5i memory snapshot</code> to create one.
+    </div>`;
+    return;
+  }
+  id('mem-snap-list').innerHTML = memSnapshots.map((s, i) => {
+    let cls = 'mem-snap-card';
+    let badge = '';
+    if (i === memSelFrom) { cls += ' sel-from'; badge = '<span class="mem-sel-badge mem-sel-from-badge">FROM</span>'; }
+    else if (i === memSelTo) { cls += ' sel-to'; badge = '<span class="mem-sel-badge mem-sel-to-badge">TO</span>'; }
+    const ts = new Date(s.timestamp);
+    const tsStr = isNaN(ts) ? s.timestamp : ts.toLocaleString();
+    return `<div class="${cls}" onclick="selectMemSnap(${i})">${badge}
+      <div class="mem-snap-head">
+        <span class="mem-oid">${esc(s.short_oid)}</span>
+        <span class="mem-ts">${esc(tsStr)}</span>
+      </div>
+      <div class="mem-nfiles">${s.file_count} file${s.file_count === 1 ? '' : 's'}</div>
+    </div>`;
+  }).join('');
+}
+
+function selectMemSnap(i) {
+  if (memSelFrom === null) {
+    memSelFrom = i;
+  } else if (memSelTo === null && i !== memSelFrom) {
+    memSelTo = i;
+  } else {
+    memSelFrom = i; memSelTo = null;
+  }
+  renderMemList();
+  updateMemControls();
+  if (memSelTo === null && memSelFrom !== null) showMemInspect(memSnapshots[memSelFrom]);
+}
+
+function clearMemSel() {
+  memSelFrom = null; memSelTo = null;
+  renderMemList(); updateMemControls();
+  id('mem-viewer').innerHTML = '<div class="mem-viewer-empty">Select a snapshot to inspect its files,<br>or select two snapshots to compare them.</div>';
+}
+
+function updateMemControls() {
+  id('mem-diff-btn').disabled = !(memSelFrom !== null && memSelTo !== null);
+  const hint = memSelFrom === null
+    ? 'Click a snapshot to inspect · click two to diff'
+    : memSelTo === null
+    ? 'Click another snapshot to compare, or click again to reset'
+    : 'Ready — click ⊕ Diff Selected';
+  setText('mem-hint', hint);
+}
+
+function showMemInspect(snap) {
+  _memFiles = snap.files || [];
+  if (!_memFiles.length) {
+    id('mem-viewer').innerHTML = '<div class="mem-viewer-empty">No files in this snapshot.</div>';
+    return;
+  }
+  const ts = new Date(snap.timestamp);
+  const tsStr = isNaN(ts) ? snap.timestamp : ts.toLocaleString();
+  let html = `<div class="mem-insp-hdr">
+    <span>📸 Snapshot</span>
+    <span class="mem-oid">${esc(snap.short_oid)}</span>
+    <span style="font-size:11px;color:#484f58;font-weight:400">${esc(tsStr)}</span>
+  </div>`;
+  html += '<div class="mem-file-tabs">';
+  _memFiles.forEach((f, i) => {
+    html += `<button class="mem-ftab${i===0?' active':''}" onclick="showMemFile(${i},this)">${esc(f.name)}</button>`;
+  });
+  html += '</div><div id="mem-file-body">' + renderMemFile(_memFiles[0]) + '</div>';
+  id('mem-viewer').innerHTML = html;
+}
+
+function showMemFile(i, el) {
+  document.querySelectorAll('.mem-ftab').forEach(t => t.classList.remove('active'));
+  el.classList.add('active');
+  id('mem-file-body').innerHTML = renderMemFile(_memFiles[i]);
+}
+
+function parseFrontmatter(content) {
+  const m = content.match(/^---\n([\s\S]*?)\n---\n?([\s\S]*)$/);
+  if (!m) return null;
+  const fm = {};
+  m[1].split('\n').forEach(line => {
+    const idx = line.indexOf(':');
+    if (idx > 0) { fm[line.slice(0,idx).trim()] = line.slice(idx+1).trim(); }
+  });
+  fm.body = m[2].trim();
+  return fm;
+}
+
+function renderMemFile(f) {
+  const fm = parseFrontmatter(f.content);
+  if (!fm) return `<pre class="mem-file-content">${esc(f.content)}</pre>`;
+  const typeTag = fm.type
+    ? `<span class="mem-type-${esc(fm.type)}">${esc(fm.type)}</span>`
+    : '';
+  let html = '<div class="mem-frontmatter">';
+  if (fm.name) html += `<div class="mem-fm-row"><span class="mem-fm-key">name</span><span class="mem-fm-val">${esc(fm.name)}</span></div>`;
+  if (fm.description) html += `<div class="mem-fm-row"><span class="mem-fm-key">description</span><span class="mem-fm-val mem-fm-desc">${esc(fm.description)}</span></div>`;
+  if (fm.type) html += `<div class="mem-fm-row"><span class="mem-fm-key">type</span>${typeTag}</div>`;
+  html += '</div>';
+  if (fm.body) html += `<div class="mem-body">${esc(fm.body)}</div>`;
+  return html;
+}
+
+async function diffMemory() {
+  if (memSelFrom === null || memSelTo === null) return;
+  const from = memSnapshots[memSelFrom].commit_oid;
+  const to   = memSnapshots[memSelTo].commit_oid;
+  id('mem-viewer').innerHTML = '<div class="mem-viewer-empty"><span class="spinner"></span> Computing diff…</div>';
+  try {
+    const diff = await fetch(`/api/memory/diff?from=${encodeURIComponent(from)}&to=${encodeURIComponent(to)}`).then(r => r.json());
+    renderMemDiff(diff);
+  } catch(e) {
+    id('mem-viewer').innerHTML = `<div class="mem-viewer-empty">Error: ${esc(String(e))}</div>`;
+  }
+}
+
+function renderMemDiff(diff) {
+  const total = diff.added_files.length + diff.removed_files.length + diff.modified_files.length;
+  let html = `<div class="mem-diff-hdr-row">
+    Diff&nbsp;<span class="mem-oid" style="color:#58a6ff">${esc(diff.from_label)}</span>
+    <span style="color:#484f58">→</span>
+    <span class="mem-oid" style="background:#1a3a2a22;color:#3fb950">${esc(diff.to_label)}</span>
+  </div>`;
+
+  if (total === 0) {
+    html += '<div class="mem-viewer-empty" style="padding:40px 0">No differences found between these two snapshots.</div>';
+    id('mem-viewer').innerHTML = html;
+    return;
+  }
+
+  html += '<div class="mem-diff-summary">';
+  if (diff.added_files.length)   html += `<span class="mem-diff-stat-add">+${diff.added_files.length} added</span>`;
+  if (diff.removed_files.length) html += `<span class="mem-diff-stat-rm">−${diff.removed_files.length} removed</span>`;
+  if (diff.modified_files.length) html += `<span class="mem-diff-stat-mod">~${diff.modified_files.length} modified</span>`;
+  html += '</div>';
+
+  diff.added_files.forEach(f => {
+    html += `<div class="mem-diff-file"><div class="mem-diff-hdr mem-diff-hdr-add">+&nbsp;${esc(f.name)}</div><div class="mem-diff-lines">`;
+    f.content.split('\n').forEach(ln => {
+      html += `<div class="mem-dl mem-dl-add"><span class="mem-gutter">+</span><span class="mem-text">${esc(ln)}</span></div>`;
+    });
+    html += '</div></div>';
+  });
+
+  diff.removed_files.forEach(name => {
+    html += `<div class="mem-diff-file"><div class="mem-diff-hdr mem-diff-hdr-rm">−&nbsp;${esc(name)}</div>
+      <div class="mem-diff-lines"><div class="mem-dl mem-dl-rm"><span class="mem-gutter">−</span><span class="mem-text" style="opacity:.6;font-style:italic">(file removed)</span></div></div></div>`;
+  });
+
+  diff.modified_files.forEach(f => {
+    html += `<div class="mem-diff-file"><div class="mem-diff-hdr mem-diff-hdr-mod">~&nbsp;${esc(f.name)}</div><div class="mem-diff-lines">`;
+    f.hunks.forEach(line => {
+      const isSep = line.kind === 'context' && line.text === '···';
+      const cls   = line.kind === 'added' ? 'mem-dl-add' : line.kind === 'removed' ? 'mem-dl-rm' : isSep ? 'mem-dl-sep' : 'mem-dl-ctx';
+      const glyph = line.kind === 'added' ? '+' : line.kind === 'removed' ? '−' : ' ';
+      html += `<div class="mem-dl ${cls}"><span class="mem-gutter">${isSep?'':glyph}</span><span class="mem-text">${esc(line.text)}</span></div>`;
+    });
+    html += '</div></div>';
+  });
+
+  id('mem-viewer').innerHTML = html;
+}
+
+// ── Sessions tab ──────────────────────────────────────────────────────────
+let slSessions = [];
+let slChurn = [];
+
+async function loadSessionList() {
+  if (slSessions.length) { renderSlList(); return; }
+  const [list, churn] = await Promise.all([
+    fetch('/api/session-log/list').then(r => r.json()),
+    fetch('/api/session-log/churn').then(r => r.json()),
+  ]);
+  slSessions = list || [];
+  slChurn = churn || [];
+  id('tab-sl-count').textContent = slSessions.length || '0';
+  renderSlList();
+}
+
+function renderSlList() {
+  const el = id('sl-list');
+  if (!slSessions.length) {
+    el.innerHTML = '<div class="sl-empty">No sessions analyzed yet.<br>Run <code>h5i analyze</code> after a Claude Code session.</div>';
+    return;
+  }
+  el.innerHTML = slSessions.map((s, i) => `
+    <div class="sl-card" id="sl-card-${i}" onclick="selectSession('${s.commit_oid}', ${i})">
+      <div class="sl-card-oid">${s.commit_oid.slice(0,8)}</div>
+      <div class="sl-card-meta">${s.analyzed_at} · ${s.message_count} msgs · ${s.tool_call_count} tools</div>
+      <div class="sl-card-badges">
+        <span class="sl-badge sl-badge-edit">✏ ${s.edited_count} edited</span>
+        <span class="sl-badge sl-badge-read">📖 ${s.consulted_count} read</span>
+        ${s.uncertainty_count > 0 ? `<span class="sl-badge sl-badge-warn">⚠ ${s.uncertainty_count} uncertain</span>` : ''}
+      </div>
+    </div>`).join('');
+}
+
+async function selectSession(oid, idx) {
+  document.querySelectorAll('.sl-card').forEach(c => c.classList.remove('active'));
+  const card = id('sl-card-' + idx);
+  if (card) card.classList.add('active');
+  id('sl-detail').innerHTML = '<div class="sl-empty"><span class="spinner"></span> Loading…</div>';
+  const data = await fetch(`/api/session-log?commit=${oid}`).then(r => r.json());
+  if (!data) {
+    id('sl-detail').innerHTML = '<div class="sl-empty">No analysis data found.</div>';
+    return;
+  }
+  renderSlDetail(data);
+}
+
+function renderSlDetail(d) {
+  let html = '';
+
+  // Trigger
+  html += `<div class="sl-section">
+    <div class="sl-section-title">Trigger</div>
+    <div class="sl-trigger">"${esc(d.causal_chain.user_trigger.slice(0,300))}"</div>
+  </div>`;
+
+  // Footprint — two columns
+  const edited = d.footprint.edited || [];
+  const consulted = d.footprint.consulted || [];
+  const implicitDeps = d.footprint.implicit_deps || [];
+  html += `<div class="sl-section">
+    <div class="sl-section-title">Exploration Footprint</div>
+    <div style="display:grid;grid-template-columns:1fr 1fr;gap:16px">
+      <div>
+        <div style="font-size:11px;color:#3fb950;font-weight:700;margin-bottom:6px">✏ EDITED (${edited.length})</div>
+        ${edited.map(f => {
+          const editCount = (d.causal_chain.edit_sequence || []).filter(s => s.file === f).length;
+          return `<div class="sl-file-row"><span class="sl-edit-icon">✏</span><span class="sl-file-name" title="${esc(f)}">${esc(shortPath(f, 30))}</span><span class="sl-file-count">×${editCount}</span></div>`;
+        }).join('') || '<div class="sl-empty" style="font-size:11px">none</div>'}
+      </div>
+      <div>
+        <div style="font-size:11px;color:#58a6ff;font-weight:700;margin-bottom:6px">📖 CONSULTED (${consulted.length})</div>
+        ${consulted.slice(0,15).map(f => `
+          <div class="sl-file-row">
+            <span class="sl-read-icon">📖</span>
+            <span class="sl-file-name" title="${esc(f.path)}">${esc(shortPath(f.path, 28))}</span>
+            <span class="sl-file-count">×${f.count}</span>
+            <span class="sl-file-tools">[${esc((f.tools||[]).join(','))}]</span>
+          </div>`).join('') || '<div class="sl-empty" style="font-size:11px">none</div>'}
+      </div>
+    </div>
+    ${implicitDeps.length ? `
+    <div style="margin-top:10px">
+      <div style="font-size:11px;color:#484f58;font-weight:700;margin-bottom:4px">→ IMPLICIT DEPS (read, never edited)</div>
+      ${implicitDeps.slice(0,8).map(f => `<div class="sl-file-row"><span class="sl-dep-icon">→</span><span class="sl-file-name" style="color:#484f58">${esc(shortPath(f,38))}</span></div>`).join('')}
+    </div>` : ''}
+  </div>`;
+
+  // Causal chain
+  const decisions = d.causal_chain.key_decisions || [];
+  const rejected = d.causal_chain.rejected_approaches || [];
+  if (decisions.length || rejected.length) {
+    html += `<div class="sl-section">
+      <div class="sl-section-title">Causal Chain</div>`;
+    if (decisions.length) {
+      html += `<div style="font-size:11px;color:#8b949e;margin-bottom:6px">KEY DECISIONS</div>`;
+      html += decisions.map((d, i) => `<div class="sl-decision"><span style="color:#484f58">${i+1}.</span> ${esc(d.slice(0,140))}</div>`).join('');
+    }
+    if (rejected.length) {
+      html += `<div style="font-size:11px;color:#8b949e;margin:10px 0 6px">CONSIDERED / REJECTED</div>`;
+      html += rejected.map(r => `<div class="sl-rejected">${esc(r.slice(0,130))}</div>`).join('');
+    }
+    html += '</div>';
+  }
+
+  // Uncertainty heatmap
+  const unc = d.uncertainty || [];
+  if (unc.length) {
+    html += `<div class="sl-section">
+      <div class="sl-section-title">Uncertainty Heatmap (${unc.length})</div>`;
+    html += unc.slice(0,12).map(a => {
+      const cls = a.confidence < 0.35 ? 'high' : (a.confidence > 0.55 ? 'low' : '');
+      const confColor = a.confidence < 0.35 ? '#f85149' : (a.confidence > 0.55 ? '#3fb950' : '#e3b341');
+      return `<div class="sl-unc-row ${cls}">
+        <div class="sl-unc-phrase">
+          <span style="color:${confColor}">${Math.round(a.confidence*100)}% conf</span>
+          &nbsp;·&nbsp; "${esc(a.phrase)}"
+          ${a.context_file ? `&nbsp;·&nbsp; <span style="color:#484f58;font-style:normal">${esc(shortPath(a.context_file,30))}</span>` : ''}
+        </div>
+        <div class="sl-unc-snippet">"${esc(a.snippet.slice(0,180))}"</div>
+        <div class="sl-unc-meta">turn ${a.turn}</div>
+      </div>`;
+    }).join('');
+    html += '</div>';
+  }
+
+  // File churn (session-local)
+  const churn = d.churn || [];
+  if (churn.length) {
+    html += `<div class="sl-section">
+      <div class="sl-section-title">File Churn (this session)</div>`;
+    html += churn.slice(0,10).map(c => `
+      <div class="sl-churn-bar">
+        <span class="sl-churn-file" title="${esc(c.file)}">${esc(shortPath(c.file,36))}</span>
+        <span style="font-size:11px;color:#3fb950">✏${c.edit_count}</span>
+        <span style="font-size:11px;color:#58a6ff;margin-left:4px">📖${c.read_count}</span>
+        <div class="sl-churn-track"><div class="sl-churn-fill" style="width:${Math.round(c.churn_score*100)}%"></div></div>
+        <span class="sl-churn-pct">${Math.round(c.churn_score*100)}%</span>
+      </div>`).join('');
+    html += '</div>';
+  }
+
+  // Bash commands sample
+  const cmds = (d.footprint.bash_commands || []).slice(0, 8);
+  if (cmds.length) {
+    html += `<div class="sl-section">
+      <div class="sl-section-title">Bash Commands (${cmds.length} shown)</div>
+      <div style="display:flex;flex-direction:column;gap:4px">
+        ${cmds.map(c => `<code style="font-size:11px;color:#8b949e;background:#0d1117;padding:3px 8px;border-radius:4px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap" title="${esc(c)}">${esc(c.slice(0,100))}</code>`).join('')}
+      </div>
+    </div>`;
+  }
+
+  // Replay hash
+  html += `<div class="sl-section">
+    <div class="sl-section-title">Replay Hash</div>
+    <div class="sl-replay-hash">${esc(d.replay_hash)}</div>
+    <div style="font-size:11px;color:#484f58;margin-top:6px">SHA-256 of the raw session JSONL — use to verify session replay reproducibility.</div>
+  </div>`;
+
+  id('sl-detail').innerHTML = html;
+}
+
+// Global churn tab (aggregated across all sessions)
+// Accessible via the churn sub-section inside any session or as standalone from session list header.
+
+function shortPath(p, max) {
+  if (!p || p.length <= max) return p || '';
+  return '…' + p.slice(-(max-1));
+}
+
 // ── Boot ──────────────────────────────────────────────────────────────────
 loadAll();
 </script>
 </body>
 </html>
 "##;
+
+// ── Frontend tests ────────────────────────────────────────────────────────────
+
+#[cfg(test)]
+mod frontend_tests {
+    use super::FRONTEND_HTML;
+    use std::collections::{HashMap, HashSet};
+
+    // ── helpers ───────────────────────────────────────────────────────────────
+
+    /// Extract the single inline `<script>…</script>` block.
+    fn extract_js(html: &str) -> &str {
+        let tag = "<script>";
+        let start = html.find(tag).expect("no <script> tag") + tag.len();
+        let end = html.rfind("</script>").expect("no </script> tag");
+        &html[start..end]
+    }
+
+    /// Map every top-level `const NAME`, `let NAME`, `function NAME(`, or
+    /// `async function NAME(` to the line numbers (1-based, relative to the
+    /// script block) where it is declared.
+    /// Only lines with no leading whitespace are considered top-level.
+    fn top_level_declarations(js: &str) -> HashMap<String, Vec<usize>> {
+        let mut map: HashMap<String, Vec<usize>> = HashMap::new();
+        for (i, line) in js.lines().enumerate() {
+            let lineno = i + 1;
+            let name: Option<String> =
+                if let Some(rest) = line.strip_prefix("const ").or_else(|| line.strip_prefix("let ")) {
+                    let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if n.is_empty() { None } else { Some(n) }
+                } else if let Some(rest) = line
+                    .strip_prefix("async function ")
+                    .or_else(|| line.strip_prefix("function "))
+                {
+                    let n: String = rest.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+                    if n.is_empty() { None } else { Some(n) }
+                } else {
+                    None
+                };
+            if let Some(name) = name {
+                map.entry(name).or_default().push(lineno);
+            }
+        }
+        map
+    }
+
+    /// Collect all static string arguments to `id('...')` and `setText('...',` calls.
+    /// Skips dynamic IDs that contain `+`, whitespace, or end with `-` (partial prefixes
+    /// used in concatenations like `id('card-' + idx)`).
+    fn collect_static_id_refs(js: &str) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        for call in &["id('", "setText('"] {
+            let mut rest = js;
+            while let Some(pos) = rest.find(call) {
+                rest = &rest[pos + call.len()..];
+                if let Some(end) = rest.find('\'') {
+                    let name = &rest[..end];
+                    if !name.contains('+')
+                        && !name.contains(' ')
+                        && !name.ends_with('-')
+                        && !name.is_empty()
+                    {
+                        ids.insert(name.to_string());
+                    }
+                    rest = &rest[end..];
+                }
+            }
+        }
+        ids
+    }
+
+    /// Collect all `id="..."` attribute values present in the HTML.
+    fn collect_html_ids(html: &str) -> HashSet<String> {
+        let mut ids = HashSet::new();
+        let needle = "id=\"";
+        let mut rest = html;
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + needle.len()..];
+            if let Some(end) = rest.find('"') {
+                ids.insert(rest[..end].to_string());
+                rest = &rest[end..];
+            }
+        }
+        ids
+    }
+
+    /// Collect all `fetch('/api/...')` path strings (without query params).
+    fn collect_fetch_paths(js: &str) -> Vec<String> {
+        let mut paths = Vec::new();
+        let needle = "fetch('/api/";
+        let mut rest = js;
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + "fetch('".len()..];
+            let end = rest.find(|c| c == '\'' || c == '?').unwrap_or(rest.len());
+            paths.push(rest[..end].to_string());
+            rest = &rest[end..];
+        }
+        paths
+    }
+
+    // ── structure ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_html_has_exactly_one_script_block() {
+        let count = FRONTEND_HTML.matches("<script>").count();
+        assert_eq!(count, 1, "Expected exactly 1 <script> block, found {}", count);
+    }
+
+    #[test]
+    fn test_html_has_doctype_and_charset() {
+        assert!(FRONTEND_HTML.starts_with("<!DOCTYPE html>"), "Missing DOCTYPE");
+        assert!(FRONTEND_HTML.contains("charset=\"UTF-8\""), "Missing charset meta tag");
+    }
+
+    // ── JavaScript declarations ───────────────────────────────────────────────
+
+    #[test]
+    fn test_no_duplicate_top_level_js_declarations() {
+        let js = extract_js(FRONTEND_HTML);
+        let decls = top_level_declarations(js);
+        let mut dups: Vec<(String, Vec<usize>)> = decls
+            .into_iter()
+            .filter(|(_, lines)| lines.len() > 1)
+            .collect();
+        dups.sort_by_key(|(n, _)| n.clone());
+        assert!(
+            dups.is_empty(),
+            "Duplicate top-level JS declarations found:\n{}",
+            dups.iter()
+                .map(|(n, lns)| format!("  '{}' declared at script lines {:?}", n, lns))
+                .collect::<Vec<_>>()
+                .join("\n")
+        );
+    }
+
+    #[test]
+    fn test_required_js_functions_defined() {
+        let js = extract_js(FRONTEND_HTML);
+        let decls = top_level_declarations(js);
+        let required = [
+            "loadAll", "loadCommits", "loadRepo",
+            "filter", "render", "renderSummary", "renderSparkline",
+            "switchTab", "commitHTML", "testBadge", "agentChartHTML",
+            "toggleFilter", "loadSessionList", "loadMemorySnapshots",
+            "id", "setText", "esc",
+        ];
+        let missing: Vec<&str> = required.iter().filter(|&&f| !decls.contains_key(f)).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "Required JS functions/variables not declared: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn test_boot_call_present() {
+        let js = extract_js(FRONTEND_HTML);
+        let last_non_empty = js.lines().rev().find(|l| !l.trim().is_empty()).unwrap_or("");
+        assert_eq!(
+            last_non_empty.trim(), "loadAll();",
+            "Expected last JS statement to be 'loadAll();', got: {:?}",
+            last_non_empty.trim()
+        );
+    }
+
+    // ── DOM elements ──────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_required_html_ids_exist() {
+        let ids = collect_html_ids(FRONTEND_HTML);
+        let required = [
+            // Timeline panel
+            "timeline-list", "search",
+            "tab-count", "pill-ai", "pill-test", "pill-fail",
+            // Stats bar
+            "s-loaded", "s-total", "s-ai", "s-tested", "s-passrate",
+            // Sidebar stats
+            "side-total", "side-ai", "side-human", "side-ratio",
+            // Header
+            "repo-name", "branch-badge",
+            // Sparkline
+            "sparkline-svg", "sparkline-label",
+            // Panels
+            "panel-timeline", "panel-summary", "panel-integrity",
+            "panel-intentgraph", "panel-review", "panel-memory", "panel-sessions",
+            // Summary panel
+            "sum-cards", "sum-charts",
+            // Sessions panel
+            "sl-list", "sl-detail",
+            // Memory panel
+            "mem-snap-list", "mem-snap-count", "mem-viewer",
+        ];
+        let missing: Vec<&str> = required.iter().filter(|&&id| !ids.contains(id)).copied().collect();
+        assert!(
+            missing.is_empty(),
+            "Required HTML id=\"...\" elements are missing: {:?}",
+            missing
+        );
+    }
+
+    #[test]
+    fn test_js_static_id_refs_exist_in_html() {
+        let js = extract_js(FRONTEND_HTML);
+        let html_ids = collect_html_ids(FRONTEND_HTML);
+        let js_refs = collect_static_id_refs(js);
+        // IDs that are created dynamically via innerHTML and won't be in the initial HTML.
+        let dynamic_ids: HashSet<&str> = [
+            "int-result", "audit-result",  // injected by integrity handlers
+        ]
+        .into_iter()
+        .collect();
+        let mut missing: Vec<String> = js_refs
+            .into_iter()
+            .filter(|id| !html_ids.contains(id.as_str()) && !dynamic_ids.contains(id.as_str()))
+            .collect();
+        missing.sort();
+        assert!(
+            missing.is_empty(),
+            "JS calls id('...') or setText('...') for IDs not present in the HTML:\n{}",
+            missing.iter().map(|s| format!("  '{}'", s)).collect::<Vec<_>>().join("\n")
+        );
+    }
+
+    #[test]
+    fn test_tab_panel_ids_match_switchtab_calls() {
+        let html_ids = collect_html_ids(FRONTEND_HTML);
+        let needle = "switchTab('";
+        let mut rest = FRONTEND_HTML;
+        let mut checked = 0usize;
+        while let Some(pos) = rest.find(needle) {
+            rest = &rest[pos + needle.len()..];
+            if let Some(end) = rest.find('\'') {
+                let tab = &rest[..end];
+                // Skip template-literal substitutions like switchTab('${t}')
+                // that appear inside the switchTab() function body itself.
+                if !tab.contains('$') && !tab.contains('{') {
+                    let panel_id = format!("panel-{}", tab);
+                    assert!(
+                        html_ids.contains(panel_id.as_str()),
+                        "switchTab('{}') referenced but id=\"{}\" not found in HTML",
+                        tab, panel_id
+                    );
+                    checked += 1;
+                }
+                rest = &rest[end..];
+            }
+        }
+        assert!(checked > 0, "No switchTab() calls found — test helper may be broken");
+    }
+
+    // ── API routes ────────────────────────────────────────────────────────────
+
+    #[test]
+    fn test_fetch_paths_are_registered_routes() {
+        let js = extract_js(FRONTEND_HTML);
+        let paths = collect_fetch_paths(js);
+        // Keep in sync with the .route() calls in serve() above.
+        let routes: HashSet<&str> = [
+            "/api/repo",
+            "/api/commits",
+            "/api/integrity",
+            "/api/integrity/commit",
+            "/api/intent-graph",
+            "/api/review-points",
+            "/api/memory/snapshots",
+            "/api/memory/diff",
+            "/api/session-log",
+            "/api/session-log/list",
+            "/api/session-log/churn",
+        ]
+        .into_iter()
+        .collect();
+        for path in &paths {
+            assert!(
+                routes.contains(path.as_str()),
+                "JS calls fetch('{}') but that path is not a registered route. \
+                 Registered routes: {:?}",
+                path,
+                {
+                    let mut v: Vec<&&str> = routes.iter().collect();
+                    v.sort();
+                    v
+                }
+            );
+        }
+        assert!(!paths.is_empty(), "No fetch('/api/...') calls found — test helper may be broken");
+    }
+
+    // ── Node.js syntax check ─────────────────────────────────────────────────
+
+    #[test]
+    fn test_js_syntax_via_node() {
+        use std::io::Write;
+        let js = extract_js(FRONTEND_HTML);
+        let Ok(mut child) = std::process::Command::new("node")
+            .arg("--check")
+            .stdin(std::process::Stdio::piped())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::piped())
+            .spawn()
+        else {
+            eprintln!("node binary not found — skipping JS syntax check");
+            return;
+        };
+        child.stdin.as_mut().unwrap().write_all(js.as_bytes()).unwrap();
+        let out = child.wait_with_output().unwrap();
+        assert!(
+            out.status.success(),
+            "node --check reported a JS syntax error:\n{}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
